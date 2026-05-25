@@ -2,6 +2,7 @@ const config = require("../config");
 const { mainMenu, playMenu, stakeKeyboard } = require("../keyboards/menus");
 const { requireRegistered, getUserByTelegramId } = require("../services/userService");
 const { formatCard, MAX } = require("../services/bingo");
+const SelectedStake = require("../models/SelectedStake");
 const {
   listOpenGames,
   createGame,
@@ -14,7 +15,6 @@ const {
 } = require("../services/gameService");
 
 const awaitingGameCode = new Set();
-let selectedStake = new Map();
 
 function registerGameHandlers(bot) {
   bot.hears("🎮 Play", async (ctx) => {
@@ -33,7 +33,7 @@ function registerGameHandlers(bot) {
       `🎮 *Fraol Bingo* (numbers 1–${MAX})\n\n` +
         `Choose how to play:\n` +
         `• *Quick Join* — join a waiting room for a stake\n` +
-        `• *Create Room* — host a new game\n` +
+        `• *Create Room* — host a new game (Admin only)\n` +
         `• *Join by Code* — enter room code from a friend\n` +
         `• *Start Game* — host starts when enough players joined`,
       { parse_mode: "Markdown", ...playMenu() }
@@ -42,7 +42,7 @@ function registerGameHandlers(bot) {
 
   bot.hears("⬅️ Back", async (ctx) => {
     awaitingGameCode.delete(ctx.from.id);
-    selectedStake.delete(ctx.from.id);
+    await SelectedStake.deleteOne({ telegramId: ctx.from.id });
     await ctx.reply("Main menu:", mainMenu());
   });
 
@@ -50,9 +50,16 @@ function registerGameHandlers(bot) {
     const user = await requireRegistered(ctx);
     if (!user) return;
 
-    selectedStake.set(ctx.from.id, {
-      mode: ctx.message.text.includes("Quick") ? "quick" : "create",
-    });
+    const isCreate = ctx.message.text.includes("Create");
+    if (isCreate && !config.adminIds.includes(ctx.from.id)) {
+      return ctx.reply("⛔ Room creation is restricted to administrators.", playMenu());
+    }
+
+    await SelectedStake.findOneAndUpdate(
+      { telegramId: ctx.from.id },
+      { mode: isCreate ? "create" : "quick" },
+      { upsert: true, new: true }
+    );
 
     await ctx.reply(
       `💵 Choose *stake* (entry fee in Birr):`,
@@ -67,12 +74,17 @@ function registerGameHandlers(bot) {
       if (!user) return;
 
       const stake = Number(ctx.match[1]);
-      const pending = selectedStake.get(ctx.from.id);
+      const pending = await SelectedStake.findOne({ telegramId: ctx.from.id }).lean();
       if (!pending) {
         return ctx.reply("Tap ⚡ Quick Join or ➕ Create Room first.", playMenu());
       }
 
-      selectedStake.delete(ctx.from.id);
+      if (pending.mode === "create" && !config.adminIds.includes(ctx.from.id)) {
+        await SelectedStake.deleteOne({ telegramId: ctx.from.id });
+        return ctx.reply("⛔ Room creation is restricted to administrators.", playMenu());
+      }
+
+      await SelectedStake.deleteOne({ telegramId: ctx.from.id });
 
       if (user.balance < stake) {
         return ctx.reply(
@@ -83,10 +95,10 @@ function registerGameHandlers(bot) {
 
       let result;
       if (pending.mode === "quick") {
-        result = await joinQuickMatch(user, stake);
+        result = await joinQuickMatch(user, stake, bot);
       } else {
         const game = await createGame(user.telegramId, stake);
-        result = await joinGame(game.code, user);
+        result = await joinGame(game.code, user, bot);
       }
 
       if (result.error) {
@@ -99,10 +111,10 @@ function registerGameHandlers(bot) {
       await ctx.reply(
         `✅ Joined room \`${g.code}\`\n\n` +
           `Stake: *${g.entryFee}* Birr · Pot: *${g.pot}* Birr\n` +
-          `Players: ${g.players.length} / ${config.minPlayersToStart}+ needed\n\n` +
+          `Players: ${g.players.length} / ${g.maxPlayers || config.maxPlayersPerGame} (auto-start when full)\n\n` +
           (g.hostId === user.telegramId
-            ? `You are the host — tap *▶️ Start Game* when ready.\n\n`
-            : `Waiting for host to start…\n\n`) +
+            ? `You are the host — tap *▶️ Start Game* to start manually, or wait for players to auto-start.\n\n`
+            : `Waiting for players / host to start…\n\n`) +
           `Your card:\n${formatCard(me.card, me.marked)}`,
         { parse_mode: "Markdown", ...playMenu() }
       );
@@ -112,9 +124,14 @@ function registerGameHandlers(bot) {
     }
   });
 
+  bot.action("deposit_cancel", async (ctx) => {
+    // Kept to avoid breaking references, handled by deposit module
+    await ctx.answerCbQuery("Cancelled");
+  });
+
   bot.action("stake_cancel", async (ctx) => {
     await ctx.answerCbQuery("Cancelled");
-    selectedStake.delete(ctx.from.id);
+    await SelectedStake.deleteOne({ telegramId: ctx.from.id });
     await ctx.reply("Cancelled.", playMenu());
   });
 
@@ -135,12 +152,12 @@ function registerGameHandlers(bot) {
 
     const games = await listOpenGames();
     if (games.length === 0) {
-      return ctx.reply("No open rooms. Create one with ➕ Create Room.", playMenu());
+      return ctx.reply("No open rooms. Wait for an admin to create one.", playMenu());
     }
 
     const lines = games.map(
       (g) =>
-        `\`${g.code}\` — ${g.entryFee} Birr · ${g.players.length} player(s) · pot ${g.pot}`
+        `\`${g.code}\` — ${g.entryFee} Birr · ${g.players.length}/${g.maxPlayers || config.maxPlayersPerGame} players · pot ${g.pot}`
     );
 
     await ctx.reply(`📋 *Open rooms*\n\n${lines.join("\n")}`, {
@@ -195,7 +212,7 @@ function registerGameHandlers(bot) {
 
       const fresh = await getUserByTelegramId(user.telegramId);
       await ctx.reply(
-        `🎉 *You won!*\n\nPrize *${result.game.pot}* Birr added.\n💰 Balance: *${fresh.balance}* Birr`,
+        `🎉 *You won!*\n\nPrize *${result.game.winnerPrize}* Birr (after 30% fee) added.\n💰 Balance: *${fresh.balance}* Birr`,
         { parse_mode: "Markdown", ...mainMenu() }
       );
     } catch (error) {
@@ -231,7 +248,7 @@ function registerGameHandlers(bot) {
     const user = await requireRegistered(ctx);
     if (!user) return;
 
-    const result = await joinGame(text, user);
+    const result = await joinGame(text, user, bot);
     if (result.error) {
       return ctx.reply(result.error, playMenu());
     }
@@ -240,7 +257,7 @@ function registerGameHandlers(bot) {
     const me = g.players.find((p) => p.telegramId === user.telegramId);
 
     await ctx.reply(
-      `✅ Joined \`${g.code}\` · ${g.players.length} players · pot ${g.pot} Birr\n\n` +
+      `✅ Joined \`${g.code}\` · ${g.players.length}/${g.maxPlayers || config.maxPlayersPerGame} players · pot ${g.pot} Birr\n\n` +
         `Your card:\n${formatCard(me.card, me.marked)}`,
       { parse_mode: "Markdown", ...playMenu() }
     );

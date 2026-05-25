@@ -1,19 +1,22 @@
 const Deposit = require("../models/Deposit");
 const User = require("../models/User");
 
-/** telegramId -> { amount } while waiting for screenshot */
-const awaitingScreenshot = new Map();
+const AwaitingScreenshot = require("../models/AwaitingScreenshot");
 
-function setAwaitingScreenshot(telegramId, amount) {
-  awaitingScreenshot.set(telegramId, { amount });
+async function setAwaitingScreenshot(telegramId, amount) {
+  await AwaitingScreenshot.findOneAndUpdate(
+    { telegramId },
+    { amount },
+    { upsert: true, new: true }
+  );
 }
 
-function getAwaitingScreenshot(telegramId) {
-  return awaitingScreenshot.get(telegramId) || null;
+async function getAwaitingScreenshot(telegramId) {
+  return AwaitingScreenshot.findOne({ telegramId }).lean();
 }
 
-function clearAwaitingScreenshot(telegramId) {
-  awaitingScreenshot.delete(telegramId);
+async function clearAwaitingScreenshot(telegramId) {
+  await AwaitingScreenshot.deleteOne({ telegramId });
 }
 
 async function hasPendingDeposit(telegramId) {

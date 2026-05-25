@@ -10,7 +10,7 @@ function registerStartHandler(bot) {
     try {
       const refCode = parseStartReferral(ctx);
       if (refCode) {
-        setPendingReferral(ctx.from.id, refCode);
+        await setPendingReferral(ctx.from.id, refCode);
       }
 
       const user = await getUserByTelegramId(ctx.from.id);

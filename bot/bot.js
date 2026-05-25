@@ -12,6 +12,8 @@ const registerWithdrawHandlers = require("../handlers/withdraw");
 const registerAdminHandlers = require("../handlers/admin");
 const registerStatusHandler = require("../handlers/status");
 
+const { recoverOrphanedGames } = require("../services/gameService");
+
 async function startBot() {
   if (!process.env.BOT_TOKEN) {
     throw new Error("BOT_TOKEN is missing in .env");
@@ -20,6 +22,9 @@ async function startBot() {
   await connectDB();
 
   const bot = new Telegraf(process.env.BOT_TOKEN);
+
+  // Recover orphaned games from database on startup
+  await recoverOrphanedGames(bot);
 
   bot.use(attachUser);
   registerStartHandler(bot);

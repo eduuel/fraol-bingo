@@ -7,7 +7,7 @@ function registerContactHandler(bot) {
   bot.on("contact", async (ctx) => {
     try {
       const contact = ctx.message.contact;
-      const refCode = consumePendingReferral(ctx.from.id);
+      const refCode = await consumePendingReferral(ctx.from.id);
 
       const { user, isNew, referralApplied } = await registerWithContact(
         ctx.from,

@@ -76,7 +76,7 @@ function registerDepositHandlers(bot) {
         );
       }
 
-      clearAwaitingScreenshot(user.telegramId);
+      await clearAwaitingScreenshot(user.telegramId);
 
       await ctx.reply(
         `💳 *Add balance*\n\n` +
@@ -105,7 +105,7 @@ function registerDepositHandlers(bot) {
         return ctx.reply("You already have a pending deposit.", mainMenu());
       }
 
-      setAwaitingScreenshot(user.telegramId, amount);
+      await setAwaitingScreenshot(user.telegramId, amount);
 
       await ctx.reply(formatTelebirrInstructions(amount), {
         parse_mode: "Markdown",
@@ -119,25 +119,25 @@ function registerDepositHandlers(bot) {
 
   bot.action("deposit_cancel", async (ctx) => {
     await ctx.answerCbQuery("Cancelled");
-    clearAwaitingScreenshot(ctx.from.id);
+    await clearAwaitingScreenshot(ctx.from.id);
     await ctx.reply("Deposit cancelled.", mainMenu());
   });
 
   bot.on("photo", async (ctx) => {
     try {
-      const pending = getAwaitingScreenshot(ctx.from.id);
+      const pending = await getAwaitingScreenshot(ctx.from.id);
       if (!pending) return;
 
       const user = await requireRegistered(ctx);
       if (!user) return;
 
       if (await hasPendingDeposit(user.telegramId)) {
-        clearAwaitingScreenshot(ctx.from.id);
+        await clearAwaitingScreenshot(ctx.from.id);
         return ctx.reply("You already have a pending deposit.", mainMenu());
       }
 
       const deposit = await createDeposit(user, pending.amount, ctx.message.photo);
-      clearAwaitingScreenshot(ctx.from.id);
+      await clearAwaitingScreenshot(ctx.from.id);
 
       await notifyAdmins(bot, deposit, user);
 
@@ -150,7 +150,7 @@ function registerDepositHandlers(bot) {
       );
     } catch (error) {
       console.error("Deposit photo error:", error);
-      clearAwaitingScreenshot(ctx.from.id);
+      await clearAwaitingScreenshot(ctx.from.id);
       await ctx.reply(
         "⚠️ Could not save your deposit. Please try 💳 Deposit again.",
         mainMenu()

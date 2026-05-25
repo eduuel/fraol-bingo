@@ -1,14 +1,22 @@
-/** Stores referral code from ?start=ref_XXX until user completes phone registration */
-const pendingReferrals = new Map();
+const PendingReferral = require("../models/PendingReferral");
 
-function setPendingReferral(telegramId, code) {
-  if (code) pendingReferrals.set(telegramId, code);
+async function setPendingReferral(telegramId, code) {
+  if (code) {
+    await PendingReferral.findOneAndUpdate(
+      { telegramId },
+      { code },
+      { upsert: true, new: true }
+    );
+  }
 }
 
-function consumePendingReferral(telegramId) {
-  const code = pendingReferrals.get(telegramId);
-  pendingReferrals.delete(telegramId);
-  return code || null;
+async function consumePendingReferral(telegramId) {
+  const record = await PendingReferral.findOne({ telegramId });
+  if (record) {
+    await PendingReferral.deleteOne({ telegramId });
+    return record.code;
+  }
+  return null;
 }
 
 function parseStartReferral(ctx) {

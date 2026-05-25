@@ -27,10 +27,18 @@ async function applyReferralBonus(newUser, referralCode) {
 
   newUser.referredBy = referrer.telegramId;
   newUser.balance += config.referralBonusNewUser;
-  referrer.balance += config.referralBonusReferrer;
-  await referrer.save();
+  newUser.referralEarnings += config.referralBonusNewUser;
 
-  return { referredBy: referrer.telegramId, referrer };
+  const updatedReferrer = await User.findOneAndUpdate(
+    { referralCode },
+    {
+      $inc: { balance: config.referralBonusReferrer, referralEarnings: config.referralBonusReferrer },
+      $addToSet: { referredUsers: newUser.telegramId }
+    },
+    { new: true }
+  );
+
+  return { referredBy: referrer.telegramId, referrer: updatedReferrer };
 }
 
 async function registerWithContact(from, contact, incomingReferralCode = null) {
@@ -108,6 +116,11 @@ async function requireRegistered(ctx) {
         "Please share your phone number using the button below to continue.",
       { parse_mode: "Markdown", ...contactRequestMenu() }
     );
+    return null;
+  }
+
+  if (user.isBanned) {
+    await ctx.reply("⛔ Your account has been banned by an administrator.");
     return null;
   }
 

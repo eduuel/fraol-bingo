@@ -25,7 +25,7 @@ async function findWaitingGameByStake(entryFee) {
   return Game.findOne({ status: "waiting", entryFee }).sort({ createdAt: -1 });
 }
 
-async function createGame(hostId, entryFee) {
+async function createGame(hostId, entryFee, maxPlayers = config.maxPlayersPerGame) {
   let code;
   do {
     code = generateGameCode();
@@ -34,6 +34,7 @@ async function createGame(hostId, entryFee) {
   return Game.create({
     code,
     entryFee,
+    maxPlayers,
     hostId,
     status: "waiting",
     players: [],
@@ -42,14 +43,22 @@ async function createGame(hostId, entryFee) {
   });
 }
 
-async function joinGame(gameCode, user) {
+async function joinGame(gameCode, user, bot) {
+  const codeNormalized = String(gameCode).toUpperCase();
   const game = await Game.findOne({
-    code: String(gameCode).toUpperCase(),
+    code: codeNormalized,
     status: "waiting",
   });
 
   if (!game) return { error: "Game not found or already started." };
-  if (game.players.length >= config.maxPlayersPerGame) {
+  
+  const freshUserCheck = await User.findOne({ telegramId: user.telegramId });
+  if (freshUserCheck && freshUserCheck.isBanned) {
+    return { error: "You are banned from playing." };
+  }
+
+  const maxPlayers = game.maxPlayers || config.maxPlayersPerGame;
+  if (game.players.length >= maxPlayers) {
     return { error: "This room is full." };
   }
   if (game.players.some((p) => p.telegramId === user.telegramId)) {
@@ -61,30 +70,75 @@ async function joinGame(gameCode, user) {
     };
   }
 
-  const freshUser = await User.findOne({ telegramId: user.telegramId });
-  freshUser.balance -= game.entryFee;
-  await freshUser.save();
+  // Atomic deduction
+  const freshUser = await User.findOneAndUpdate(
+    { telegramId: user.telegramId, balance: { $gte: game.entryFee }, isBanned: { $ne: true } },
+    { $inc: { balance: -game.entryFee } },
+    { new: true }
+  );
+  if (!freshUser) {
+    return { error: "Insufficient balance or your account is banned." };
+  }
 
   const { card, marked } = generateCard();
-  game.players.push({
-    telegramId: user.telegramId,
-    username: user.username,
-    firstName: user.firstName,
-    card,
-    marked,
-  });
-  game.pot += game.entryFee;
-  await game.save();
+  
+  // Atomic push & pot increase
+  const updatedGame = await Game.findOneAndUpdate(
+    {
+      code: codeNormalized,
+      status: "waiting",
+      "players.telegramId": { $ne: user.telegramId },
+      [`players.${maxPlayers - 1}`]: { $exists: false }
+    },
+    {
+      $push: {
+        players: {
+          telegramId: user.telegramId,
+          username: user.username,
+          firstName: user.firstName,
+          card,
+          marked,
+          hasBingo: false
+        }
+      },
+      $inc: { pot: game.entryFee }
+    },
+    { new: true }
+  );
 
-  return { game, user: freshUser };
+  // If update failed (e.g. room filled up or game started/cancelled in the split second)
+  if (!updatedGame) {
+    // Refund the deducted fee
+    await User.findOneAndUpdate(
+      { telegramId: user.telegramId },
+      { $inc: { balance: game.entryFee } }
+    );
+    
+    // Find precise error
+    const gameCheck = await Game.findOne({ code: codeNormalized });
+    if (!gameCheck) return { error: "Game not found." };
+    if (gameCheck.status !== "waiting") return { error: "Game already started." };
+    if (gameCheck.players.some((p) => p.telegramId === user.telegramId)) {
+      return { error: "You are already in this game." };
+    }
+    return { error: "This room is full." };
+  }
+
+  // Auto-start check
+  if (updatedGame.players.length >= maxPlayers) {
+    // Fire & forget start
+    startGame(updatedGame, bot).catch(console.error);
+  }
+
+  return { game: updatedGame, user: freshUser };
 }
 
-async function joinQuickMatch(user, entryFee) {
-  let game = await findWaitingGameByStake(entryFee);
+async function joinQuickMatch(user, entryFee, bot) {
+  const game = await findWaitingGameByStake(entryFee);
   if (!game) {
-    game = await createGame(user.telegramId, entryFee);
+    return { error: "No open rooms available at this stake. Please wait for an administrator to create one." };
   }
-  return joinGame(game.code, user);
+  return joinGame(game.code, user, bot);
 }
 
 async function startGame(game, bot) {
@@ -96,6 +150,7 @@ async function startGame(game, bot) {
   }
 
   game.status = "playing";
+  game.gameStartedAt = new Date();
   await game.save();
 
   const msg =
@@ -175,33 +230,77 @@ async function claimBingo(gameCode, telegramId, bot) {
 async function awardWinner(game, player, lines, bot) {
   stopGameLoop(game.code);
 
+  const houseFee = Math.round(game.pot * 0.3);
+  const winnerPrize = game.pot - houseFee;
+
   game.status = "finished";
   game.winnerId = player.telegramId;
   game.winnerName = player.firstName || player.username || "Player";
+  game.houseFee = houseFee;
+  game.winnerPrize = winnerPrize;
+  game.gameFinishedAt = new Date();
+  if (game.gameStartedAt) {
+    game.durationSeconds = Math.round((game.gameFinishedAt - game.gameStartedAt) / 1000);
+  }
   await game.save();
 
-  const winner = await User.findOne({ telegramId: player.telegramId });
-  if (winner) {
-    winner.balance += game.pot;
-    winner.gamesWon = (winner.gamesWon || 0) + 1;
-    winner.gamesPlayed = (winner.gamesPlayed || 0) + 1;
-    await winner.save();
-  }
+  // Award winner atomically
+  await User.findOneAndUpdate(
+    { telegramId: player.telegramId },
+    {
+      $inc: {
+        balance: winnerPrize,
+        totalWinnings: winnerPrize,
+        gamesWon: 1,
+        gamesPlayed: 1
+      }
+    }
+  );
 
+  // Mark games played for others
   for (const p of game.players) {
     if (p.telegramId === player.telegramId) continue;
-    const u = await User.findOne({ telegramId: p.telegramId });
-    if (u) {
-      u.gamesPlayed = (u.gamesPlayed || 0) + 1;
-      await u.save();
-    }
+    await User.findOneAndUpdate(
+      { telegramId: p.telegramId },
+      { $inc: { gamesPlayed: 1 } }
+    );
+  }
+
+  // Create lightweight GameHistory doc
+  try {
+    const GameHistory = require("../models/GameHistory");
+    await GameHistory.create({
+      code: game.code,
+      entryFee: game.entryFee,
+      playerCount: game.players.length,
+      pot: game.pot,
+      houseFee: game.houseFee,
+      winnerPrize: game.winnerPrize,
+      status: "finished",
+      winner: {
+        telegramId: player.telegramId,
+        username: player.username,
+        firstName: player.firstName
+      },
+      players: game.players.map(p => ({
+        telegramId: p.telegramId,
+        username: p.username,
+        firstName: p.firstName
+      })),
+      totalNumbersCalled: game.calledNumbers.length,
+      durationSeconds: game.durationSeconds,
+      finishedAt: game.gameFinishedAt
+    });
+  } catch (err) {
+    console.error("Failed to save game history:", err);
   }
 
   const winMsg =
     `🎉 *BINGO! Game ${game.code}*\n\n` +
     `Winner: *${game.winnerName}*\n` +
     `Line: ${lines.join(", ")}\n` +
-    `Prize: *${game.pot}* Birr`;
+    `Prize: *${winnerPrize}* Birr (after 30% fee)\n` +
+    `House Fee: *${houseFee}* Birr`;
 
   for (const p of game.players) {
     try {
@@ -215,20 +314,49 @@ async function awardWinner(game, player, lines, bot) {
 async function endGameNoWinner(game, bot) {
   stopGameLoop(game.code);
   game.status = "finished";
+  game.houseFee = 0;
+  game.winnerPrize = 0;
+  game.gameFinishedAt = new Date();
+  if (game.gameStartedAt) {
+    game.durationSeconds = Math.round((game.gameFinishedAt - game.gameStartedAt) / 1000);
+  }
   await game.save();
 
   for (const p of game.players) {
-    const u = await User.findOne({ telegramId: p.telegramId });
-    if (u) {
-      u.balance += game.entryFee;
-      await u.save();
-    }
+    await User.findOneAndUpdate(
+      { telegramId: p.telegramId },
+      { $inc: { balance: game.entryFee } }
+    );
     try {
       await bot.telegram.sendMessage(
         p.telegramId,
         `Game ${game.code} ended — all ${MAX} numbers called. Entry refunded.`
       );
     } catch (_) {}
+  }
+
+  // Create lightweight GameHistory doc
+  try {
+    const GameHistory = require("../models/GameHistory");
+    await GameHistory.create({
+      code: game.code,
+      entryFee: game.entryFee,
+      playerCount: game.players.length,
+      pot: game.pot,
+      houseFee: 0,
+      winnerPrize: 0,
+      status: "no_winner",
+      players: game.players.map(p => ({
+        telegramId: p.telegramId,
+        username: p.username,
+        firstName: p.firstName
+      })),
+      totalNumbersCalled: game.calledNumbers.length,
+      durationSeconds: game.durationSeconds,
+      finishedAt: game.gameFinishedAt
+    });
+  } catch (err) {
+    console.error("Failed to save game history:", err);
   }
 }
 
@@ -254,6 +382,121 @@ async function getWaitingGameForUser(telegramId) {
   });
 }
 
+async function cancelGame(gameCode, bot) {
+  const game = await Game.findOne({ code: String(gameCode).toUpperCase() });
+  if (!game) return { error: "Game not found." };
+  if (game.status === "finished" || game.status === "cancelled") {
+    return { error: `Game is already ${game.status}.` };
+  }
+
+  stopGameLoop(game.code);
+
+  game.status = "cancelled";
+  game.gameFinishedAt = new Date();
+  if (game.gameStartedAt) {
+    game.durationSeconds = Math.round((game.gameFinishedAt - game.gameStartedAt) / 1000);
+  }
+  await game.save();
+
+  for (const p of game.players) {
+    await User.findOneAndUpdate(
+      { telegramId: p.telegramId },
+      { $inc: { balance: game.entryFee } }
+    );
+    try {
+      await bot.telegram.sendMessage(
+        p.telegramId,
+        `⚠️ *Game Cancelled*\n\nGame \`${game.code}\` was cancelled by an administrator. Your entry fee of *${game.entryFee} Birr* has been refunded.`,
+        { parse_mode: "Markdown" }
+      );
+    } catch (_) {}
+  }
+
+  // Create lightweight GameHistory doc
+  try {
+    const GameHistory = require("../models/GameHistory");
+    await GameHistory.create({
+      code: game.code,
+      entryFee: game.entryFee,
+      playerCount: game.players.length,
+      pot: game.pot,
+      houseFee: 0,
+      winnerPrize: 0,
+      status: "cancelled",
+      players: game.players.map(p => ({
+        telegramId: p.telegramId,
+        username: p.username,
+        firstName: p.firstName
+      })),
+      totalNumbersCalled: game.calledNumbers.length,
+      durationSeconds: game.durationSeconds,
+      finishedAt: game.gameFinishedAt
+    });
+  } catch (err) {
+    console.error("Failed to save cancel game history:", err);
+  }
+
+  return { success: true };
+}
+
+async function recoverOrphanedGames(bot) {
+  try {
+    const orphanedGames = await Game.find({ status: "playing" });
+    if (orphanedGames.length === 0) return;
+
+    console.log(`🔍 Found ${orphanedGames.length} orphaned active games. Cancelling and refunding...`);
+
+    for (const game of orphanedGames) {
+      game.status = "cancelled";
+      game.gameFinishedAt = new Date();
+      if (game.gameStartedAt) {
+        game.durationSeconds = Math.round((game.gameFinishedAt - game.gameStartedAt) / 1000);
+      }
+      await game.save();
+
+      for (const p of game.players) {
+        await User.findOneAndUpdate(
+          { telegramId: p.telegramId },
+          { $inc: { balance: game.entryFee } }
+        );
+        try {
+          await bot.telegram.sendMessage(
+            p.telegramId,
+            `⚠️ *System Restart Notification*\n\nGame \`${game.code}\` was aborted due to a server restart. Your entry fee of *${game.entryFee} Birr* has been refunded.`,
+            { parse_mode: "Markdown" }
+          );
+        } catch (_) {}
+      }
+
+      // Create lightweight GameHistory doc
+      try {
+        const GameHistory = require("../models/GameHistory");
+        await GameHistory.create({
+          code: game.code,
+          entryFee: game.entryFee,
+          playerCount: game.players.length,
+          pot: game.pot,
+          houseFee: 0,
+          winnerPrize: 0,
+          status: "cancelled_restart",
+          players: game.players.map(p => ({
+            telegramId: p.telegramId,
+            username: p.username,
+            firstName: p.firstName
+          })),
+          totalNumbersCalled: game.calledNumbers.length,
+          durationSeconds: game.durationSeconds,
+          finishedAt: game.gameFinishedAt
+        });
+      } catch (err) {
+        console.error("Failed to save recovery game history:", err);
+      }
+    }
+  } catch (error) {
+    console.error("Error recovering orphaned games:", error);
+  }
+}
+
 module.exports = {
   listOpenGames,
   createGame,
@@ -264,4 +507,6 @@ module.exports = {
   getActiveGameForUser,
   getWaitingGameForUser,
   stopGameLoop,
+  cancelGame,
+  recoverOrphanedGames,
 };
